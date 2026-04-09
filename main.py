@@ -125,13 +125,23 @@ Proveď důkladné code review následujícího pull requestu.
 {diff_preview}
 ```
 
-Proveď review z těchto pohledů a strukturuj odpověď do sekcí:
+Proveď code review tohoto PR. Zaměř se jen na podstatné problémy a přínosné připomínky.
+
+Pravidla:
+* Uváděj konkrétní nálezy s odkazem na soubor a řádky.
+* U každého nálezu uveď závažnost: `critical / major / minor / nit`.
+* Rozlišuj mezi **bugem/rizikem** a **doporučením**.
+* Ke každému relevantnímu problému navrhni stručnou opravu.
+* Pokud něco bez širšího kontextu nelze posoudit, napiš to explicitně.
+* Pokud nejsou nalezeny žádné problémy, napiš to stručně a nevymýšlej je.
+
+Strukturuj odpověď do sekcí:
 
 ### 🔍 Přehled změn
 Stručně shrň, co PR dělá.
 
 ### 🐛 Bugy a logické chyby
-Konkrétní problémy s odkazem na řádky. Pokud žádné, napiš "Nenalezeny".
+Konkrétní problémy s odkazem na řádky. Pokud žádné, napiš „Nenalezeny“.
 
 ### 🔒 Bezpečnost
 XSS, SQL injection, autorizace, citlivá data v logu atd.
@@ -140,14 +150,27 @@ XSS, SQL injection, autorizace, citlivá data v logu atd.
 Zbytečné dotazy, N+1, paměť, velké cykly.
 
 ### 🧪 Pokrytí testy
-Chybí testy? Které případy nejsou pokryty?
+Chybí testy? Které scénáře nebo edge cases nejsou pokryty?
+
+### 🏗️ Návrh a architektura
+Je řešení dobře navržené? Nevzniká zbytečná složitost nebo těsná vazba?
 
 ### 📖 Čitelnost a konvence
 Pojmenování, komentáře, složitost funkcí, DRY.
 
+### 🔄 Riziko regresí
+Co může tato změna nepřímo rozbít a co by se mělo otestovat ručně?
+
+### 🎯 Soulad se zadáním
+Plní změna očekávaný cíl? Není něco nedokončené nebo zavádějící?
+
 ### ✅ Závěr
+
 **Doporučení:** APPROVE / REQUEST CHANGES / NEEDS DISCUSSION
-**Klíčové body:** (max 3 odrážky co je nejdůležitější)
+**Klíčové body:**
+* max 3 nejdůležitější body
+
+Na konci přidej krátké shrnutí, co je blocker a co je jen doporučení.
 """
 
 
