@@ -55,6 +55,7 @@ async def get_bitbucket_diff(workspace: str, repo_slug: str, pr_id: int) -> str:
             url,
             headers={"Authorization": f"Bearer {BB_APP_PASSWORD}"},
             timeout=30,
+            follow_redirects=True,
         )
         resp.raise_for_status()
         return resp.text
