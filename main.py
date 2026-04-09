@@ -17,11 +17,9 @@ app = FastAPI()
 
 # ---------------------------------------------------------------------------
 # Konfigurace – nastav jako Environment Variables (nikdy nekládej klíče do kódu!)
-# Používáme .get() aby server nastartoval i bez proměnných a chybu hlásil až při volání
 # ---------------------------------------------------------------------------
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-BB_USERNAME       = os.environ.get("BB_USERNAME", "")
-BB_APP_PASSWORD   = os.environ.get("BB_APP_PASSWORD", "")  # Atlassian API token (od září 2025)
+BB_APP_PASSWORD   = os.environ.get("BB_APP_PASSWORD", "")  # Bitbucket repository access token
 JIRA_BASE_URL     = os.environ.get("JIRA_BASE_URL", "")    # https://tvoje-firma.atlassian.net
 JIRA_EMAIL        = os.environ.get("JIRA_EMAIL", "")
 JIRA_API_TOKEN    = os.environ.get("JIRA_API_TOKEN", "")
@@ -42,20 +40,15 @@ def extract_jira_id(text: str) -> str | None:
     return match.group(1).upper() if match else None
 
 
-async def get_bitbucket_diff(workspace: str, repo_slug: str, pr_id: int) -> str:
-    """Stáhne unified diff PR z Bitbucket Cloud API.
-    Používá Bearer token (Atlassian API token) místo Basic Auth – nový standard od září 2025.
+async def get_bitbucket_diff(diff_url: str) -> str:
+    """Stáhne unified diff PR přímo z URL z Bitbucket payloadu.
+    Používá Bearer token a follow_redirects=True pro případ přesměrování.
     """
-    url = (
-        f"https://api.bitbucket.org/2.0/repositories/"
-        f"{workspace}/{repo_slug}/pullrequests/{pr_id}/diff"
-    )
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(follow_redirects=True) as client:
         resp = await client.get(
-            url,
+            diff_url,
             headers={"Authorization": f"Bearer {BB_APP_PASSWORD}"},
             timeout=30,
-            follow_redirects=True,
         )
         resp.raise_for_status()
         return resp.text
@@ -95,7 +88,6 @@ def _extract_text(field) -> str:
         return ""
     if isinstance(field, str):
         return field
-    # ADF – rekurzivně vytáhni text uzly
     texts = []
     def walk(node):
         if isinstance(node, dict):
@@ -212,9 +204,7 @@ async def call_claude(prompt: str) -> str:
 async def post_bitbucket_comment(
     workspace: str, repo_slug: str, pr_id: int, comment: str
 ) -> None:
-    """Přidá komentář do Bitbucket PR.
-    Používá Bearer token – nový standard Bitbucket od září 2025.
-    """
+    """Přidá komentář do Bitbucket PR pomocí Bearer tokenu."""
     url = (
         f"https://api.bitbucket.org/2.0/repositories/"
         f"{workspace}/{repo_slug}/pullrequests/{pr_id}/comments"
@@ -245,7 +235,7 @@ async def bitbucket_webhook(request: Request):
 
     payload = await request.json()
 
-    # Ověř event typ – reagujeme jen na vytvoření nebo update PR
+    # Reagujeme jen na vytvoření nebo update PR
     event = request.headers.get("X-Event-Key", "")
     if event not in ("pullrequest:created", "pullrequest:updated"):
         return JSONResponse({"status": "ignored", "event": event})
@@ -257,29 +247,30 @@ async def bitbucket_webhook(request: Request):
     branch    = pr.get("source", {}).get("branch", {}).get("name", "")
     repo      = payload.get("repository", {})
 
-    # full_name = "workspace/repo-slug" – spolehlivější než repo.workspace.slug
-    # Funguje pro jakýkoliv repozitář kde webhook zapneš
+    # Diff URL přichází přímo v payloadu – spolehlivější než sestavovat URL ručně
+    diff_url  = pr.get("links", {}).get("diff", {}).get("href", "")
+
+    # full_name = "workspace/repo-slug" – funguje pro jakýkoliv repozitář
     full_name = repo.get("full_name", "")
     workspace, _, repo_slug = full_name.partition("/")
 
-    if not all([pr_id, workspace, repo_slug]):
-        raise HTTPException(400, f"Chybí data: pr_id={pr_id} workspace='{workspace}' repo_slug='{repo_slug}' full_name='{full_name}'")
+    if not all([pr_id, workspace, repo_slug, diff_url]):
+        raise HTTPException(400, f"Chybí data: pr_id={pr_id} workspace='{workspace}' repo_slug='{repo_slug}' diff_url='{diff_url}'")
 
     # Jira ID hledáme v branch → title → description (v tomto pořadí)
-    # Funguje pro: bugfix/JIP-360-master, "Bugfix/JIP-360 master", "* FIX - JIP-360 - ..."
     jira_id = extract_jira_id(branch) or extract_jira_id(pr_title) or extract_jira_id(pr_desc)
 
     print(f"[CR] PR #{pr_id} | branch: {branch} | Jira: {jira_id}")
 
     # Stáhni diff a Jira ticket
-    diff = await get_bitbucket_diff(workspace, repo_slug, pr_id)
+    diff = await get_bitbucket_diff(diff_url)
     jira = await get_jira_ticket(jira_id) if jira_id else {}
 
     # Sestav prompt a zavolej Claude
-    prompt  = build_prompt(diff, jira, pr_title)
-    review  = await call_claude(prompt)
+    prompt = build_prompt(diff, jira, pr_title)
+    review = await call_claude(prompt)
 
-    # Přidej hlavičku s info o CR botu a vlož komentář do PR
+    # Vlož komentář do PR
     header = (
         f"🤖 **Automatické code review** (Claude AI)"
         f"{' | Jira: ' + jira_id if jira_id else ''}\n\n"
