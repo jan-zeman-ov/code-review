@@ -25,7 +25,8 @@ JIRA_BASE_URL     = os.environ.get("JIRA_BASE_URL", "")
 JIRA_EMAIL        = os.environ.get("JIRA_EMAIL", "")
 JIRA_API_TOKEN    = os.environ.get("JIRA_API_TOKEN", "")
 
-JIRA_ID_PATTERN = re.compile(r"([A-Z]{2,10}-\d+)")
+# re.IGNORECASE = funguje i pro malá písmena (jip-357 → JIP-357)
+JIRA_ID_PATTERN = re.compile(r"([A-Z]{2,10}-\d+)", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -33,9 +34,11 @@ JIRA_ID_PATTERN = re.compile(r"([A-Z]{2,10}-\d+)")
 # ---------------------------------------------------------------------------
 
 def extract_jira_id(text: str) -> str | None:
-    """Vytáhne první Jira ID (např. EMT-94) z libovolného textu."""
+    """Vytáhne první Jira ID z textu a převede na velká písmena.
+    Funguje pro: revert/keep-jip-353, JIP-357, EMT-94 atd.
+    """
     match = JIRA_ID_PATTERN.search(text or "")
-    return match.group(1) if match else None
+    return match.group(1).upper() if match else None
 
 
 async def get_bitbucket_diff(workspace: str, repo_slug: str, pr_id: int) -> str:
@@ -238,16 +241,19 @@ async def bitbucket_webhook(request: Request):
     pr        = payload.get("pullrequest", {})
     pr_id     = pr.get("id")
     pr_title  = pr.get("title", "")
+    pr_desc   = pr.get("description", "")
     branch    = pr.get("source", {}).get("branch", {}).get("name", "")
     repo      = payload.get("repository", {})
-    workspace = repo.get("workspace", {}).get("slug", "")
-    repo_slug = repo.get("slug", "")
+
+    # full_name = "workspace/repo-slug" – spolehlivější než repo.workspace.slug
+    full_name = repo.get("full_name", "")
+    workspace, _, repo_slug = full_name.partition("/")
 
     if not all([pr_id, workspace, repo_slug]):
         raise HTTPException(400, "Chybí povinná data v payloadu")
 
-    # Najdi Jira ID – nejdřív v branch, pak v titulku PR
-    jira_id = extract_jira_id(branch) or extract_jira_id(pr_title)
+    # Jira ID hledáme v branch → title → description (v tomto pořadí)
+    jira_id = extract_jira_id(branch) or extract_jira_id(pr_title) or extract_jira_id(pr_desc)
 
     print(f"[CR] PR #{pr_id} | branch: {branch} | Jira: {jira_id}")
 
