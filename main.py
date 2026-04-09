@@ -5,6 +5,8 @@ Nasazení: Railway / Render / vlastní server
 Požadavky: viz requirements.txt
 """
 
+from __future__ import annotations
+
 import re
 import os
 import httpx
@@ -16,13 +18,12 @@ app = FastAPI()
 # ---------------------------------------------------------------------------
 # Konfigurace – nastav jako Environment Variables (nikdy nekládej klíče do kódu!)
 # ---------------------------------------------------------------------------
-ANTHROPIC_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
-BB_USERNAME         = os.environ["BB_USERNAME"]          # Bitbucket Cloud username
-BB_APP_PASSWORD     = os.environ["BB_APP_PASSWORD"]      # Bitbucket App Password
-JIRA_BASE_URL       = os.environ["JIRA_BASE_URL"]        # https://yourcompany.atlassian.net
-JIRA_EMAIL          = os.environ["JIRA_EMAIL"]
-JIRA_API_TOKEN      = os.environ["JIRA_API_TOKEN"]       # Jira API token
-WEBHOOK_SECRET      = os.environ.get("WEBHOOK_SECRET", "")  # volitelné ověření
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+BB_USERNAME       = os.environ.get("BB_USERNAME", "")
+BB_APP_PASSWORD   = os.environ.get("BB_APP_PASSWORD", "")
+JIRA_BASE_URL     = os.environ.get("JIRA_BASE_URL", "")
+JIRA_EMAIL        = os.environ.get("JIRA_EMAIL", "")
+JIRA_API_TOKEN    = os.environ.get("JIRA_API_TOKEN", "")
 
 JIRA_ID_PATTERN = re.compile(r"([A-Z]{2,10}-\d+)")
 
@@ -219,6 +220,14 @@ async def post_bitbucket_comment(
 
 @app.post("/webhook/bitbucket")
 async def bitbucket_webhook(request: Request):
+    missing = [k for k, v in {
+        "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
+        "BB_USERNAME": BB_USERNAME,
+        "BB_APP_PASSWORD": BB_APP_PASSWORD,
+    }.items() if not v]
+    if missing:
+        raise HTTPException(500, f"Chybí env variables: {', '.join(missing)}")
+
     payload = await request.json()
 
     # Ověř event typ
@@ -226,14 +235,13 @@ async def bitbucket_webhook(request: Request):
     if event not in ("pullrequest:created", "pullrequest:updated"):
         return JSONResponse({"status": "ignored", "event": event})
 
-    pr = payload.get("pullrequest", {})
-    pr_id    = pr.get("id")
-    pr_title = pr.get("title", "")
-    source   = pr.get("source", {})
-    branch   = source.get("branch", {}).get("name", "")
-    repo     = payload.get("repository", {})
-    workspace  = repo.get("workspace", {}).get("slug", "")
-    repo_slug  = repo.get("slug", "")
+    pr        = payload.get("pullrequest", {})
+    pr_id     = pr.get("id")
+    pr_title  = pr.get("title", "")
+    branch    = pr.get("source", {}).get("branch", {}).get("name", "")
+    repo      = payload.get("repository", {})
+    workspace = repo.get("workspace", {}).get("slug", "")
+    repo_slug = repo.get("slug", "")
 
     if not all([pr_id, workspace, repo_slug]):
         raise HTTPException(400, "Chybí povinná data v payloadu")
@@ -244,15 +252,11 @@ async def bitbucket_webhook(request: Request):
     print(f"[CR] PR #{pr_id} | branch: {branch} | Jira: {jira_id}")
 
     # Paralelně stáhni diff a Jira ticket
-    diff_task  = get_bitbucket_diff(workspace, repo_slug, pr_id)
-    jira_task  = get_jira_ticket(jira_id) if jira_id else None
+    diff = await get_bitbucket_diff(workspace, repo_slug, pr_id)
+    jira = await get_jira_ticket(jira_id) if jira_id else {}
 
-    diff = await diff_task
-    jira = await jira_task if jira_task else {}
-
-    # Sestav prompt a zavolej Claude
-    prompt  = build_prompt(diff, jira, pr_title)
-    review  = await call_claude(prompt)
+    prompt = build_prompt(diff, jira, pr_title)
+    review = await call_claude(prompt)
 
     # Přidej prefix s info o CR botu
     header = (
@@ -266,4 +270,13 @@ async def bitbucket_webhook(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    missing = [k for k, v in {
+        "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
+        "BB_USERNAME": BB_USERNAME,
+        "BB_APP_PASSWORD": BB_APP_PASSWORD,
+        "JIRA_BASE_URL": JIRA_BASE_URL,
+    }.items() if not v]
+    return {
+        "status": "ok",
+        "config": "complete" if not missing else f"missing: {missing}"
+    }
