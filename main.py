@@ -181,7 +181,6 @@ Na konci přidej krátké shrnutí, co je blocker a co je jen doporučení.
 
 
 async def call_claude(prompt: str) -> str:
-    """Zavolá Anthropic Claude API a vrátí text odpovědi."""
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -196,6 +195,8 @@ async def call_claude(prompt: str) -> str:
                 "messages": [{"role": "user", "content": prompt}],
             },
         )
+        if not resp.is_success:
+            print(f"[Claude ERROR] status={resp.status_code} body={resp.text}")
         resp.raise_for_status()
         data = resp.json()
         return data["content"][0]["text"]
