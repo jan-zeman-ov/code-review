@@ -250,7 +250,7 @@ async def bitbucket_webhook(request: Request):
     workspace, _, repo_slug = full_name.partition("/")
 
     if not all([pr_id, workspace, repo_slug]):
-        raise HTTPException(400, "Chybí povinná data v payloadu")
+        raise HTTPException(400, f"Chybí data: pr_id={pr_id} workspace='{workspace}' repo_slug='{repo_slug}' full_name='{full_name}'")
 
     # Jira ID hledáme v branch → title → description (v tomto pořadí)
     jira_id = extract_jira_id(branch) or extract_jira_id(pr_title) or extract_jira_id(pr_desc)
