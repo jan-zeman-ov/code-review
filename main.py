@@ -17,11 +17,12 @@ app = FastAPI()
 
 # ---------------------------------------------------------------------------
 # Konfigurace – nastav jako Environment Variables (nikdy nekládej klíče do kódu!)
+# Používáme .get() aby server nastartoval i bez proměnných a chybu hlásil až při volání
 # ---------------------------------------------------------------------------
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 BB_USERNAME       = os.environ.get("BB_USERNAME", "")
-BB_APP_PASSWORD   = os.environ.get("BB_APP_PASSWORD", "")
-JIRA_BASE_URL     = os.environ.get("JIRA_BASE_URL", "")
+BB_APP_PASSWORD   = os.environ.get("BB_APP_PASSWORD", "")  # Atlassian API token (od září 2025)
+JIRA_BASE_URL     = os.environ.get("JIRA_BASE_URL", "")    # https://tvoje-firma.atlassian.net
 JIRA_EMAIL        = os.environ.get("JIRA_EMAIL", "")
 JIRA_API_TOKEN    = os.environ.get("JIRA_API_TOKEN", "")
 
@@ -35,20 +36,26 @@ JIRA_ID_PATTERN = re.compile(r"([A-Z]{2,10}-\d+)", re.IGNORECASE)
 
 def extract_jira_id(text: str) -> str | None:
     """Vytáhne první Jira ID z textu a převede na velká písmena.
-    Funguje pro: revert/keep-jip-353, JIP-357, EMT-94 atd.
+    Funguje pro: revert/keep-jip-353, JIP-357, EMT-94, bugfix/JIP-360-master atd.
     """
     match = JIRA_ID_PATTERN.search(text or "")
     return match.group(1).upper() if match else None
 
 
 async def get_bitbucket_diff(workspace: str, repo_slug: str, pr_id: int) -> str:
-    """Stáhne unified diff PR z Bitbucket Cloud API."""
+    """Stáhne unified diff PR z Bitbucket Cloud API.
+    Používá Bearer token (Atlassian API token) místo Basic Auth – nový standard od září 2025.
+    """
     url = (
         f"https://api.bitbucket.org/2.0/repositories/"
         f"{workspace}/{repo_slug}/pullrequests/{pr_id}/diff"
     )
     async with httpx.AsyncClient() as client:
-        resp = await client.get(url, auth=(BB_USERNAME, BB_APP_PASSWORD), timeout=30)
+        resp = await client.get(
+            url,
+            headers={"Authorization": f"Bearer {BB_APP_PASSWORD}"},
+            timeout=30,
+        )
         resp.raise_for_status()
         return resp.text
 
@@ -69,9 +76,8 @@ async def get_jira_ticket(jira_id: str) -> dict:
         data = resp.json()
         fields = data.get("fields", {})
 
-        # Acceptance criteria jsou typicky v custom field nebo v description
         description = _extract_text(fields.get("description"))
-        ac = _extract_text(fields.get("customfield_10016"))  # uprav podle vaší instance
+        ac = _extract_text(fields.get("customfield_10016"))  # uprav podle vaší Jira instance
 
         return {
             "id": jira_id,
@@ -83,7 +89,7 @@ async def get_jira_ticket(jira_id: str) -> dict:
 
 
 def _extract_text(field) -> str:
-    """Převede Atlassian Document Format (ADF) nebo plain string na text."""
+    """Převede Atlassian Document Format (ADF) nebo plain string na čistý text."""
     if not field:
         return ""
     if isinstance(field, str):
@@ -145,7 +151,7 @@ Strukturuj odpověď do sekcí:
 Stručně shrň, co PR dělá.
 
 ### 🐛 Bugy a logické chyby
-Konkrétní problémy s odkazem na řádky. Pokud žádné, napiš „Nenalezeny“.
+Konkrétní problémy s odkazem na řádky. Pokud žádné, napiš "Nenalezeny".
 
 ### 🔒 Bezpečnost
 XSS, SQL injection, autorizace, citlivá data v logu atd.
@@ -153,8 +159,12 @@ XSS, SQL injection, autorizace, citlivá data v logu atd.
 ### ⚡ Výkon
 Zbytečné dotazy, N+1, paměť, velké cykly.
 
-### 🧪 Pokrytí testy
-Chybí testy? Které scénáře nebo edge cases nejsou pokryty?
+### 🧪 Unit testy (POVINNÉ)
+Zkontroluj, zda jsou všechny změněné funkce a metody pokryty unit testy.
+- Pokud testy chybí, vypiš KONKRÉTNĚ které testy je nutné doplnit.
+- Pro každý chybějící test uveď: název testu, co testuje, a jaký edge case pokrývá.
+- Příklad: test_order_creation_with_invalid_sku – ověřit že objednávka s neplatným SKU vrátí ValidationError.
+- Pokud jsou testy v pořádku, napiš "Pokryto".
 
 ### 🏗️ Návrh a architektura
 Je řešení dobře navržené? Nevzniká zbytečná složitost nebo těsná vazba?
@@ -169,7 +179,6 @@ Co může tato změna nepřímo rozbít a co by se mělo otestovat ručně?
 Plní změna očekávaný cíl? Není něco nedokončené nebo zavádějící?
 
 ### ✅ Závěr
-
 **Doporučení:** APPROVE / REQUEST CHANGES / NEEDS DISCUSSION
 **Klíčové body:**
 * max 3 nejdůležitější body
@@ -202,7 +211,9 @@ async def call_claude(prompt: str) -> str:
 async def post_bitbucket_comment(
     workspace: str, repo_slug: str, pr_id: int, comment: str
 ) -> None:
-    """Přidá komentář do Bitbucket PR."""
+    """Přidá komentář do Bitbucket PR.
+    Používá Bearer token – nový standard Bitbucket od září 2025.
+    """
     url = (
         f"https://api.bitbucket.org/2.0/repositories/"
         f"{workspace}/{repo_slug}/pullrequests/{pr_id}/comments"
@@ -210,7 +221,7 @@ async def post_bitbucket_comment(
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             url,
-            auth=(BB_USERNAME, BB_APP_PASSWORD),
+            headers={"Authorization": f"Bearer {BB_APP_PASSWORD}"},
             json={"content": {"raw": comment}},
             timeout=15,
         )
@@ -223,9 +234,9 @@ async def post_bitbucket_comment(
 
 @app.post("/webhook/bitbucket")
 async def bitbucket_webhook(request: Request):
+    # Ověř že jsou nastaveny klíčové proměnné
     missing = [k for k, v in {
         "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
-        "BB_USERNAME": BB_USERNAME,
         "BB_APP_PASSWORD": BB_APP_PASSWORD,
     }.items() if not v]
     if missing:
@@ -233,7 +244,7 @@ async def bitbucket_webhook(request: Request):
 
     payload = await request.json()
 
-    # Ověř event typ
+    # Ověř event typ – reagujeme jen na vytvoření nebo update PR
     event = request.headers.get("X-Event-Key", "")
     if event not in ("pullrequest:created", "pullrequest:updated"):
         return JSONResponse({"status": "ignored", "event": event})
@@ -246,6 +257,7 @@ async def bitbucket_webhook(request: Request):
     repo      = payload.get("repository", {})
 
     # full_name = "workspace/repo-slug" – spolehlivější než repo.workspace.slug
+    # Funguje pro jakýkoliv repozitář kde webhook zapneš
     full_name = repo.get("full_name", "")
     workspace, _, repo_slug = full_name.partition("/")
 
@@ -253,18 +265,20 @@ async def bitbucket_webhook(request: Request):
         raise HTTPException(400, f"Chybí data: pr_id={pr_id} workspace='{workspace}' repo_slug='{repo_slug}' full_name='{full_name}'")
 
     # Jira ID hledáme v branch → title → description (v tomto pořadí)
+    # Funguje pro: bugfix/JIP-360-master, "Bugfix/JIP-360 master", "* FIX - JIP-360 - ..."
     jira_id = extract_jira_id(branch) or extract_jira_id(pr_title) or extract_jira_id(pr_desc)
 
     print(f"[CR] PR #{pr_id} | branch: {branch} | Jira: {jira_id}")
 
-    # Paralelně stáhni diff a Jira ticket
+    # Stáhni diff a Jira ticket
     diff = await get_bitbucket_diff(workspace, repo_slug, pr_id)
     jira = await get_jira_ticket(jira_id) if jira_id else {}
 
-    prompt = build_prompt(diff, jira, pr_title)
-    review = await call_claude(prompt)
+    # Sestav prompt a zavolej Claude
+    prompt  = build_prompt(diff, jira, pr_title)
+    review  = await call_claude(prompt)
 
-    # Přidej prefix s info o CR botu
+    # Přidej hlavičku s info o CR botu a vlož komentář do PR
     header = (
         f"🤖 **Automatické code review** (Claude AI)"
         f"{' | Jira: ' + jira_id if jira_id else ''}\n\n"
@@ -276,13 +290,15 @@ async def bitbucket_webhook(request: Request):
 
 @app.get("/health")
 async def health():
+    """Kontrola stavu serveru a konfigurace."""
     missing = [k for k, v in {
         "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
-        "BB_USERNAME": BB_USERNAME,
         "BB_APP_PASSWORD": BB_APP_PASSWORD,
         "JIRA_BASE_URL": JIRA_BASE_URL,
+        "JIRA_EMAIL": JIRA_EMAIL,
+        "JIRA_API_TOKEN": JIRA_API_TOKEN,
     }.items() if not v]
     return {
         "status": "ok",
-        "config": "complete" if not missing else f"missing: {missing}"
+        "config": "complete" if not missing else f"missing: {missing}",
     }
