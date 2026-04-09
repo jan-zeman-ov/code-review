@@ -19,10 +19,17 @@ app = FastAPI()
 # Konfigurace – nastav jako Environment Variables (nikdy nekládej klíče do kódu!)
 # ---------------------------------------------------------------------------
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-BB_APP_PASSWORD   = os.environ.get("BB_APP_PASSWORD", "")  # Bitbucket repository access token
-JIRA_BASE_URL     = os.environ.get("JIRA_BASE_URL", "")    # https://tvoje-firma.atlassian.net
-JIRA_EMAIL        = os.environ.get("JIRA_EMAIL", "")
-JIRA_API_TOKEN    = os.environ.get("JIRA_API_TOKEN", "")
+
+# Token pro každý repozitář zvlášť – přidej nový řádek pro každé repo
+# V Railway nastav: BB_TOKEN_NETDIRECT_TEST, BB_TOKEN_JIP_SHOP atd.
+BB_TOKENS = {
+    "netdirect-test": os.environ.get("BB_TOKEN_NETDIRECT_TEST", ""),
+    "jip-shop":       os.environ.get("BB_TOKEN_JIP_SHOP", ""),
+}
+
+JIRA_BASE_URL  = os.environ.get("JIRA_BASE_URL", "")   # https://tvoje-firma.atlassian.net
+JIRA_EMAIL     = os.environ.get("JIRA_EMAIL", "")
+JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN", "")
 
 # re.IGNORECASE = funguje i pro malá písmena (jip-357 → JIP-357)
 JIRA_ID_PATTERN = re.compile(r"([A-Z]{2,10}-\d+)", re.IGNORECASE)
@@ -40,14 +47,14 @@ def extract_jira_id(text: str) -> str | None:
     return match.group(1).upper() if match else None
 
 
-async def get_bitbucket_diff(diff_url: str) -> str:
+async def get_bitbucket_diff(diff_url: str, token: str) -> str:
     """Stáhne unified diff PR přímo z URL z Bitbucket payloadu.
     Používá Bearer token a follow_redirects=True pro případ přesměrování.
     """
     async with httpx.AsyncClient(follow_redirects=True) as client:
         resp = await client.get(
             diff_url,
-            headers={"Authorization": f"Bearer {BB_APP_PASSWORD}"},
+            headers={"Authorization": f"Bearer {token}"},
             timeout=30,
         )
         resp.raise_for_status()
@@ -114,8 +121,8 @@ def build_prompt(diff: str, jira: dict, pr_title: str) -> str:
 **Acceptance criteria:** {jira['acceptance_criteria'] or '(není)'}
 """
 
-    # Diff zkrátíme na max ~8000 znaků, aby se vešel do kontextového okna
-    diff_preview = diff[:8000] + ("\n...[diff zkrácen]" if len(diff) > 8000 else "")
+    # Diff zkrátíme na max ~16000 znaků
+    diff_preview = diff[:16000] + ("\n...[diff zkrácen]" if len(diff) > 16000 else "")
 
     return f"""Jsi senior software engineer a QA inženýr s 10+ lety zkušeností.
 Proveď důkladné code review následujícího pull requestu.
@@ -181,6 +188,7 @@ Na konci přidej krátké shrnutí, co je blocker a co je jen doporučení.
 
 
 async def call_claude(prompt: str) -> str:
+    """Zavolá Anthropic Claude API a vrátí text odpovědi."""
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -191,7 +199,7 @@ async def call_claude(prompt: str) -> str:
             },
             json={
                 "model": "claude-sonnet-4-6",
-                "max_tokens": 2048,
+                "max_tokens": 4096,
                 "messages": [{"role": "user", "content": prompt}],
             },
         )
@@ -203,7 +211,7 @@ async def call_claude(prompt: str) -> str:
 
 
 async def post_bitbucket_comment(
-    workspace: str, repo_slug: str, pr_id: int, comment: str
+    workspace: str, repo_slug: str, pr_id: int, comment: str, token: str
 ) -> None:
     """Přidá komentář do Bitbucket PR pomocí Bearer tokenu."""
     url = (
@@ -213,7 +221,7 @@ async def post_bitbucket_comment(
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             url,
-            headers={"Authorization": f"Bearer {BB_APP_PASSWORD}"},
+            headers={"Authorization": f"Bearer {token}"},
             json={"content": {"raw": comment}},
             timeout=15,
         )
@@ -226,13 +234,9 @@ async def post_bitbucket_comment(
 
 @app.post("/webhook/bitbucket")
 async def bitbucket_webhook(request: Request):
-    # Ověř že jsou nastaveny klíčové proměnné
-    missing = [k for k, v in {
-        "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
-        "BB_APP_PASSWORD": BB_APP_PASSWORD,
-    }.items() if not v]
-    if missing:
-        raise HTTPException(500, f"Chybí env variables: {', '.join(missing)}")
+    # Ověř že je nastaven Anthropic klíč
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(500, "Chybí ANTHROPIC_API_KEY")
 
     payload = await request.json()
 
@@ -248,7 +252,7 @@ async def bitbucket_webhook(request: Request):
     branch    = pr.get("source", {}).get("branch", {}).get("name", "")
     repo      = payload.get("repository", {})
 
-    # Diff URL přichází přímo v payloadu – spolehlivější než sestavovat URL ručně
+    # Diff URL přichází přímo v payloadu
     diff_url  = pr.get("links", {}).get("diff", {}).get("href", "")
 
     # full_name = "workspace/repo-slug" – funguje pro jakýkoliv repozitář
@@ -256,7 +260,13 @@ async def bitbucket_webhook(request: Request):
     workspace, _, repo_slug = full_name.partition("/")
 
     if not all([pr_id, workspace, repo_slug, diff_url]):
-        raise HTTPException(400, f"Chybí data: pr_id={pr_id} workspace='{workspace}' repo_slug='{repo_slug}' diff_url='{diff_url}'")
+        raise HTTPException(400, f"Chybí data: pr_id={pr_id} workspace='{workspace}' repo_slug='{repo_slug}'")
+
+    # Vyber token podle repozitáře
+    token = BB_TOKENS.get(repo_slug, "")
+    if not token:
+        env_name = f"BB_TOKEN_{repo_slug.upper().replace('-', '_')}"
+        raise HTTPException(400, f"Chybí BB token pro repozitář '{repo_slug}' – přidej '{env_name}' do Railway Variables")
 
     # Jira ID hledáme v branch → title → description (v tomto pořadí)
     jira_id = extract_jira_id(branch) or extract_jira_id(pr_title) or extract_jira_id(pr_desc)
@@ -264,7 +274,7 @@ async def bitbucket_webhook(request: Request):
     print(f"[CR] PR #{pr_id} | branch: {branch} | Jira: {jira_id}")
 
     # Stáhni diff a Jira ticket
-    diff = await get_bitbucket_diff(diff_url)
+    diff = await get_bitbucket_diff(diff_url, token)
     jira = await get_jira_ticket(jira_id) if jira_id else {}
 
     # Sestav prompt a zavolej Claude
@@ -276,7 +286,7 @@ async def bitbucket_webhook(request: Request):
         f"🤖 **Automatické code review** (Claude AI)"
         f"{' | Jira: ' + jira_id if jira_id else ''}\n\n"
     )
-    await post_bitbucket_comment(workspace, repo_slug, pr_id, header + review)
+    await post_bitbucket_comment(workspace, repo_slug, pr_id, header + review, token)
 
     return JSONResponse({"status": "ok", "pr_id": pr_id, "jira_id": jira_id})
 
@@ -284,14 +294,11 @@ async def bitbucket_webhook(request: Request):
 @app.get("/health")
 async def health():
     """Kontrola stavu serveru a konfigurace."""
-    missing = [k for k, v in {
-        "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
-        "BB_APP_PASSWORD": BB_APP_PASSWORD,
-        "JIRA_BASE_URL": JIRA_BASE_URL,
-        "JIRA_EMAIL": JIRA_EMAIL,
-        "JIRA_API_TOKEN": JIRA_API_TOKEN,
-    }.items() if not v]
+    configured_repos = [repo for repo, token in BB_TOKENS.items() if token]
+    missing_anthropic = not ANTHROPIC_API_KEY
     return {
         "status": "ok",
-        "config": "complete" if not missing else f"missing: {missing}",
+        "anthropic": "ok" if not missing_anthropic else "missing ANTHROPIC_API_KEY",
+        "repos_configured": configured_repos,
+        "jira": "ok" if JIRA_BASE_URL else "missing JIRA_BASE_URL",
     }
