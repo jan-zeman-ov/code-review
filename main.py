@@ -13,30 +13,49 @@ import os
 import json
 import asyncio
 import fnmatch
+import hmac
+import hashlib
+import sqlite3
+import time
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
-# Cache zpracovaných PR – zabraňuje duplicitnímu review při Bitbucket retry
-import time
-_processed_prs: dict[str, float] = {}
+# ---------------------------------------------------------------------------
+# Dedup přes SQLite — přežije restart serveru
+# ---------------------------------------------------------------------------
 DEDUP_TTL = 900  # 15 minut
+_db = sqlite3.connect("dedup.db", check_same_thread=False)
+_db.execute(
+    "CREATE TABLE IF NOT EXISTS processed_prs "
+    "(key TEXT PRIMARY KEY, ts REAL)"
+)
+_db.commit()
 
 def _is_already_processed(key: str) -> bool:
-    if key in _processed_prs:
-        if time.time() - _processed_prs[key] < DEDUP_TTL:
-            return True
-        del _processed_prs[key]
+    row = _db.execute(
+        "SELECT ts FROM processed_prs WHERE key = ?", (key,)
+    ).fetchone()
+    if row and time.time() - row[0] < DEDUP_TTL:
+        return True
+    # Expirovaný záznam — smaž
+    _db.execute("DELETE FROM processed_prs WHERE key = ?", (key,))
+    _db.commit()
     return False
 
 def _mark_as_processed(key: str) -> None:
-    _processed_prs[key] = time.time()
-    cutoff = time.time() - DEDUP_TTL
-    for k in list(_processed_prs.keys()):
-        if _processed_prs[k] < cutoff:
-            del _processed_prs[k]
+    _db.execute(
+        "INSERT OR REPLACE INTO processed_prs (key, ts) VALUES (?, ?)",
+        (key, time.time()),
+    )
+    # Uklidění starých záznamů
+    _db.execute(
+        "DELETE FROM processed_prs WHERE ts < ?",
+        (time.time() - DEDUP_TTL,),
+    )
+    _db.commit()
 
 # ---------------------------------------------------------------------------
 # Konfigurace – nastav jako Environment Variables (nikdy nekládej klíče do kódu!)
@@ -160,68 +179,119 @@ def count_changed_lines(diff: str) -> int:
 # Detekce stack verzi — Angular a .NET
 # ---------------------------------------------------------------------------
 
-async def get_angular_version(workspace: str, repo_slug: str, token: str) -> str | None:
-    """Načte hlavní verzi Angularu z package.json v repozitáři."""
+BB_WEBHOOK_SECRET = os.environ.get("BB_WEBHOOK_SECRET", "")
+
+def _verify_webhook_signature(secret: str, body: bytes, signature: str) -> bool:
+    """Ověří Bitbucket webhook HMAC podpis. Přeskoč pokud secret není nastaven."""
+    if not secret:
+        return True  # secret není nakonfigurován — přeskoč ověření
+    expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(f"sha256={expected}", signature or "")
+
+
+async def _fetch_json_file(client: httpx.AsyncClient, workspace: str, repo_slug: str,
+                            token: str, path: str) -> dict | None:
+    """Stáhne JSON soubor ze specifické cesty v repozitáři."""
     url = (
         f"https://api.bitbucket.org/2.0/repositories/"
-        f"{workspace}/{repo_slug}/src/HEAD/package.json"
+        f"{workspace}/{repo_slug}/src/HEAD/{path}"
     )
+    resp = await client.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+    if not resp.is_success:
+        return None
+    try:
+        return resp.json()
+    except Exception:
+        return None
+
+
+async def _list_dir(client: httpx.AsyncClient, workspace: str, repo_slug: str,
+                     token: str, path: str = "") -> list[dict]:
+    """Vrátí seznam souborů v dané cestě repozitáře."""
+    url = (
+        f"https://api.bitbucket.org/2.0/repositories/"
+        f"{workspace}/{repo_slug}/src/HEAD/{path}"
+    )
+    resp = await client.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+    if not resp.is_success:
+        return []
+    return resp.json().get("values", [])
+
+
+async def get_angular_version(workspace: str, repo_slug: str, token: str) -> str | None:
+    """
+    Načte hlavní verzi Angularu z package.json.
+    Hledá v rootu a pak v podsložkách (AdminMvc/, FlexMvc/ atd.)
+    Pokud @angular/core není nalezen vůbec, vrátí "6" jako bezpečný fallback
+    protože starší Angular projekty bývají v6 a Claude by měl použít NgModules kontext.
+    """
     async with httpx.AsyncClient(follow_redirects=True) as client:
         try:
-            resp = await client.get(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=10,
-            )
-            if not resp.is_success:
-                return None
-            pkg = resp.json()
-            deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
-            version = deps.get("@angular/core", "")
-            match = re.search(r"(\d+)", version)
-            return match.group(1) if match else None
+            # Kandidátní cesty — root + časté podsložky MVC projektů
+            candidates = ["package.json"]
+            root_files = await _list_dir(client, workspace, repo_slug, token)
+            for f in root_files:
+                if f.get("type") == "commit_directory":
+                    candidates.append(f"{f['path']}/package.json")
+
+            seen_versions = set()
+            for path in candidates:
+                pkg = await _fetch_json_file(client, workspace, repo_slug, token, path)
+                if not pkg:
+                    continue
+                deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+                version = deps.get("@angular/core", "")
+                if not version:
+                    continue
+                match = re.search(r"(\d+)", version)
+                if match:
+                    seen_versions.add(match.group(1))
+
+            if not seen_versions:
+                # Angular projekt ale verze nenalezena → fallback na v12 (NgModules)
+                return "12"
+            # Vrať nejvyšší nalezenou verzi
+            return str(max(int(v) for v in seen_versions))
         except Exception:
-            return None
+            return "12"  # bezpečný fallback
 
 
 async def get_dotnet_version(workspace: str, repo_slug: str, token: str) -> str | None:
-    """Načte verzi .NET z .csproj souboru — prohledá root repozitáře."""
-    url = f"https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/src/HEAD/"
+    """
+    Načte verzi .NET z .csproj souboru.
+    Hledá v rootu a pak v podsložkách (jeden level).
+    """
     async with httpx.AsyncClient(follow_redirects=True) as client:
         try:
-            resp = await client.get(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=10,
-            )
-            if not resp.is_success:
-                return None
-            files = resp.json().get("values", [])
-            csproj = next(
-                (f["path"] for f in files if f["path"].endswith(".csproj")), None
-            )
-            if not csproj:
-                return None
+            # Hledej .csproj v rootu i podsložkách
+            candidates: list[str] = []
+            root_files = await _list_dir(client, workspace, repo_slug, token)
+            for f in root_files:
+                if f["path"].endswith(".csproj"):
+                    candidates.append(f["path"])
+                elif f.get("type") == "commit_directory":
+                    sub_files = await _list_dir(client, workspace, repo_slug, token, f["path"])
+                    for sf in sub_files:
+                        if sf["path"].endswith(".csproj"):
+                            candidates.append(sf["path"])
 
-            proj_url = (
-                f"https://api.bitbucket.org/2.0/repositories/"
-                f"{workspace}/{repo_slug}/src/HEAD/{csproj}"
-            )
-            proj_resp = await client.get(
-                proj_url,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=10,
-            )
-            if not proj_resp.is_success:
-                return None
-
-            content = proj_resp.text
-            # <TargetFramework>net8.0</TargetFramework> nebo <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
-            match = re.search(
-                r"<TargetFramework(?:Version)?>(.*?)</TargetFramework(?:Version)?>",
-                content,
-            )
-            return match.group(1).strip() if match else None
+            for csproj_path in candidates:
+                url = (
+                    f"https://api.bitbucket.org/2.0/repositories/"
+                    f"{workspace}/{repo_slug}/src/HEAD/{csproj_path}"
+                )
+                resp = await client.get(
+                    url, headers={"Authorization": f"Bearer {token}"}, timeout=10
+                )
+                if not resp.is_success:
+                    continue
+                match = re.search(
+                    r"<TargetFramework(?:Version)?>(.*?)</TargetFramework(?:Version)?>",
+                    resp.text,
+                )
+                if match:
+                    return match.group(1).strip()
+            return None
         except Exception:
             return None
 
@@ -509,26 +579,41 @@ Vrať POUZE validní JSON bez jakéhokoliv dalšího textu nebo markdown backtic
 
 
 async def call_claude(prompt: str) -> str:
-    """Zavolá Anthropic Claude API a vrátí text odpovědi."""
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-6",
-                "max_tokens": 4096,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-        )
-        if not resp.is_success:
-            print(f"[Claude ERROR] status={resp.status_code} body={resp.text}")
-        resp.raise_for_status()
-        data = resp.json()
-        return data["content"][0]["text"]
+    """Zavolá Anthropic Claude API s exponential backoff retry (529, 503, timeout)."""
+    delays = [2, 5, 10]  # sekundy mezi pokusy
+    last_error: Exception | None = None
+    for attempt, delay in enumerate([0] + delays, 1):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": ANTHROPIC_API_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 8192,
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                )
+                if resp.status_code in (529, 503):
+                    print(f"[Claude] Attempt {attempt} — overloaded ({resp.status_code}), retry...")
+                    last_error = Exception(f"Claude overloaded: {resp.status_code}")
+                    continue
+                if not resp.is_success:
+                    print(f"[Claude ERROR] status={resp.status_code} body={resp.text}")
+                resp.raise_for_status()
+                data = resp.json()
+                return data["content"][0]["text"]
+        except httpx.TimeoutException as e:
+            print(f"[Claude] Attempt {attempt} — timeout, retry...")
+            last_error = e
+            continue
+    raise Exception(f"Claude selhal po {len(delays)+1} pokusech: {last_error}")
 
 
 async def post_bitbucket_comment(
@@ -598,7 +683,15 @@ async def bitbucket_webhook(request: Request):
     if not ANTHROPIC_API_KEY:
         raise HTTPException(500, "Chybí ANTHROPIC_API_KEY")
 
-    payload = await request.json()
+    body = await request.body()
+
+    # 2. Ověření webhook podpisu
+    if BB_WEBHOOK_SECRET:
+        signature = request.headers.get("X-Hub-Signature", "")
+        if not _verify_webhook_signature(BB_WEBHOOK_SECRET, body, signature):
+            raise HTTPException(401, "Neplatný webhook podpis")
+
+    payload = json.loads(body)
 
     event = request.headers.get("X-Event-Key", "")
     if event not in ("pullrequest:created", "pullrequest:updated"):
@@ -626,7 +719,8 @@ async def bitbucket_webhook(request: Request):
     jira_id = extract_jira_id(branch) or extract_jira_id(pr_title) or extract_jira_id(pr_desc)
 
     # Deduplikace — ignoruj Bitbucket retry webhooky
-    dedup_key = f"{workspace}/{repo_slug}/{pr_id}"
+    commit_hash = pr.get("source", {}).get("commit", {}).get("hash", "")
+    dedup_key = f"{workspace}/{repo_slug}/{pr_id}/{commit_hash}"
     if _is_already_processed(dedup_key):
         print(f"[CR] PR #{pr_id} duplicate — ignoruji")
         return JSONResponse({"status": "duplicate", "pr_id": pr_id})
@@ -752,22 +846,22 @@ async def bitbucket_webhook(request: Request):
 
     await post_bitbucket_comment(workspace, repo_slug, pr_id, header, token)
 
-    # 2. Inline komentáře přímo k řádkům
-    posted = 0
-    for item in comments:
+    # 2. Inline komentáře přímo k řádkům — paralelně
+    async def _post_inline(item: dict) -> bool:
         file_path = item.get("file", "")
         line      = item.get("line")
         comment   = item.get("comment", "")
         severity  = item.get("severity", "minor")
         category  = item.get("category", "")
-
         if not file_path or not line or not comment:
-            continue
-
+            return False
         text = f"{format_severity(severity)} {format_category(category)}\n\n{comment}"
         await post_bitbucket_comment(workspace, repo_slug, pr_id, text, token,
                                      file_path=file_path, line=line)
-        posted += 1
+        return True
+
+    results = await asyncio.gather(*[_post_inline(item) for item in comments])
+    posted = sum(1 for r in results if r)
 
     print(f"[CR] PR #{pr_id} hotovo | inline komentářů: {posted}")
     return JSONResponse({"status": "ok", "pr_id": pr_id, "jira_id": jira_id,
@@ -782,6 +876,7 @@ async def health():
         "anthropic": "ok" if ANTHROPIC_API_KEY else "missing",
         "repos_configured": configured_repos,
         "jira": "ok" if JIRA_BASE_URL else "missing JIRA_BASE_URL",
+        "webhook_secret": "ok" if BB_WEBHOOK_SECRET else "⚠️ not set — webhook not verified",
         "poc_config": {
             "max_lines": POC_MAX_LINES,
             "ignored_files": IGNORED_FILES,
