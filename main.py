@@ -23,12 +23,20 @@ app = FastAPI()
 # ---------------------------------------------------------------------------
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
-# Token pro každý repozitář zvlášť – přidej nový řádek pro každé repo
-# V Railway nastav: BB_TOKEN_NETDIRECT_TEST, BB_TOKEN_JIP_SHOP atd.
-BB_TOKENS = {
-    "netdirect-test": os.environ.get("BB_TOKEN_NETDIRECT_TEST", ""),
-    "jip-shop":       os.environ.get("BB_TOKEN_JIP_SHOP", ""),
-}
+# Tokeny se načítají automaticky z environment variables s prefixem BB_TOKEN_
+# Stačí přidat do Railway: BB_TOKEN_BIESSE_WEB, BB_TOKEN_JIP_SHOP atd.
+# Název proměnné: BB_TOKEN_ + název repo VELKÝMI PÍSMENY s pomlčkami nahrazenými podtržítky
+# Příklad: repo "biesse-web" → BB_TOKEN_BIESSE_WEB
+def _load_bb_tokens() -> dict[str, str]:
+    tokens = {}
+    for key, value in os.environ.items():
+        if key.startswith("BB_TOKEN_") and value:
+            # BB_TOKEN_BIESSE_WEB → biesse-web
+            repo_slug = key[len("BB_TOKEN_"):].lower().replace("_", "-")
+            tokens[repo_slug] = value
+    return tokens
+
+BB_TOKENS = _load_bb_tokens()
 
 JIRA_BASE_URL  = os.environ.get("JIRA_BASE_URL", "")
 JIRA_EMAIL     = os.environ.get("JIRA_EMAIL", "")
