@@ -229,7 +229,7 @@ def build_prompt(diff: str, jira: dict, pr_title: str, line_count: int, ignored_
 Tvým úkolem je code review z pohledu člověka, který bude tento kód udržovat za 2 roky v noci při výpadku produkce.
 Buď přísný, konkrétní a nelítostný — ale spravedlivý. Nevymýšlej problémy, ale žádný skutečný problém nepřehlédni.
 
-P�i review se ptej:
+Při review se ptej:
 - Bude tento kód čitelný za 2 roky bez původního autora?
 - Co se stane když tato funkce dostane 10x více requestů?
 - Kde jsou skryté memory leaky, race conditions nebo N+1 dotazy?
@@ -245,6 +245,9 @@ Zásady pro tvoje hodnocení:
 - Nezmiňuj obecné "best practices" pokud nejsou porušeny přímo v tomto diffu.
 - Pokud je kód v pořádku, řekni to — nepřidávej umělé výhrady jen aby review vypadalo důkladněji.
 - U každého nálezu musíš být schopen říct: "Na řádku X v souboru Y vidím konkrétně toto."
+- Piš stručně — autor PR zná kontext, nepotřebuje vysvětlení základních pojmů. Maximálně 2-3 věty na každý nález.
+- Každý nález začni prefixem: "BLOCKER:" nebo "DOPORUČENÍ:" nebo "OTÁZKA:" — jasně odděl co blokuje merge a co je jen připomínka.
+- Pokud nevidíš testové soubory v diffu, napiš pouze: "Testy v diffu nejsou — ověřit ručně." Nic víc.
 
 ## Pull request
 **Název PR:** {pr_title}
