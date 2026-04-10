@@ -265,8 +265,10 @@ Zásady pro tvoje hodnocení:
 - Pokud je kód v pořádku, řekni to — nepřidávej umělé výhrady jen aby review vypadalo důkladněji.
 - U každého nálezu musíš být schopen říct: "Na řádku X v souboru Y vidím konkrétně toto."
 - Piš stručně — autor PR zná kontext, nepotřebuje vysvětlení základních pojmů. Maximálně 2-3 věty na každý nález.
-- Každý nález začni prefixem: "BLOCKER:" nebo "DOPORUČENÍ:" nebo "OTÁZKA:" — jasně odděl co blokuje merge a co je jen připomínka.
-- Pokud nevidíš testové soubory v diffu, napiš pouze: "Testy v diffu nejsou — ověřit ručně." Nic víc.
+- Každý nález začni prefixem: "BLOCKER:" nebo "DOPORUČENÍ:" nebo "OTÁZKA:"
+- Pokud nevidíš testové soubory v diffu, napiš pouze: "Testy v diffu nejsou — ověřit ručně."
+- Ignoruj triviální nálezy jako zakomentovaný kód, chybějící mezery, nebo drobné formátování
+- Pokud nález nepomůže předejít bugu, výpadku nebo technickému dluhu, nevypisuj ho.
 
 ## Pull request
 **Název PR:** {pr_title}
