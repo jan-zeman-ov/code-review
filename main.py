@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 import os
 import json
+import asyncio
 import fnmatch
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -21,7 +22,7 @@ app = FastAPI()
 # Cache zpracovaných PR – zabraňuje duplicitnímu review při Bitbucket retry
 import time
 _processed_prs: dict[str, float] = {}
-DEDUP_TTL = 900  # 5 minut
+DEDUP_TTL = 900  # 15 minut
 
 def _is_already_processed(key: str) -> bool:
     if key in _processed_prs:
@@ -156,6 +157,135 @@ def count_changed_lines(diff: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Detekce stack verzi — Angular a .NET
+# ---------------------------------------------------------------------------
+
+async def get_angular_version(workspace: str, repo_slug: str, token: str) -> str | None:
+    """Načte hlavní verzi Angularu z package.json v repozitáři."""
+    url = (
+        f"https://api.bitbucket.org/2.0/repositories/"
+        f"{workspace}/{repo_slug}/src/HEAD/package.json"
+    )
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        try:
+            resp = await client.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
+            )
+            if not resp.is_success:
+                return None
+            pkg = resp.json()
+            deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+            version = deps.get("@angular/core", "")
+            match = re.search(r"(\d+)", version)
+            return match.group(1) if match else None
+        except Exception:
+            return None
+
+
+async def get_dotnet_version(workspace: str, repo_slug: str, token: str) -> str | None:
+    """Načte verzi .NET z .csproj souboru — prohledá root repozitáře."""
+    url = f"https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/src/HEAD/"
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        try:
+            resp = await client.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
+            )
+            if not resp.is_success:
+                return None
+            files = resp.json().get("values", [])
+            csproj = next(
+                (f["path"] for f in files if f["path"].endswith(".csproj")), None
+            )
+            if not csproj:
+                return None
+
+            proj_url = (
+                f"https://api.bitbucket.org/2.0/repositories/"
+                f"{workspace}/{repo_slug}/src/HEAD/{csproj}"
+            )
+            proj_resp = await client.get(
+                proj_url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
+            )
+            if not proj_resp.is_success:
+                return None
+
+            content = proj_resp.text
+            # <TargetFramework>net8.0</TargetFramework> nebo <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
+            match = re.search(
+                r"<TargetFramework(?:Version)?>(.*?)</TargetFramework(?:Version)?>",
+                content,
+            )
+            return match.group(1).strip() if match else None
+        except Exception:
+            return None
+
+
+def _angular_note(version: str | None) -> str:
+    """Vrátí kontext pro Claude podle verze Angularu."""
+    if not version:
+        return ""
+    v = int(version)
+    if v <= 8:
+        return (
+            f"Angular {v} — NgModules architektura, žádné standalone komponenty, "
+            f"HttpClient přes HttpClientModule, RxJS pipeable operators"
+        )
+    elif v <= 12:
+        return (
+            f"Angular {v} — přechodné období, Ivy renderer (možná ještě ViewEngine), "
+            f"NgModules jako standard, žádné Signals"
+        )
+    elif v <= 16:
+        return (
+            f"Angular {v} — Ivy, standalone komponenty jako opt-in (ne default), "
+            f"žádné Signals, inject() funkce dostupná"
+        )
+    elif v == 17:
+        return (
+            f"Angular {v} — standalone komponenty jako DEFAULT, "
+            f"Signals jako developer preview, nový @if/@for control flow jako opt-in"
+        )
+    else:
+        return (
+            f"Angular {v} — Signals stabilní a preferované před RxJS pro lokální stav, "
+            f"@if/@for/@switch jako standard (ne *ngIf/*ngFor), "
+            f"standalone komponenty jako výchozí"
+        )
+
+
+def _dotnet_note(version: str | None) -> str:
+    """Vrátí kontext pro Claude podle verze .NET."""
+    if not version:
+        return ""
+    if "v4." in version or "net4" in version:
+        return (
+            f".NET Framework {version} — "
+            f"bez ConfigureAwait(false) hrozí deadlock v synchronizačním kontextu, "
+            f"HttpClient musí být static/singleton (není IHttpClientFactory), "
+            f"žádné record types ani pattern matching, "
+            f"Entity Framework 6 (NE EF Core) — lazy loading je DEFAULT ZAPNUTÝ pozor na N+1, "
+            f"async void je problém mimo event handlery"
+        )
+    major = re.search(r"net(\d+)", version)
+    v = int(major.group(1)) if major else 0
+    if v >= 8:
+        return (
+            f".NET {v} — primary constructors, collection expressions, frozen collections, "
+            f"IHttpClientFactory jako standard, EF Core s lazy loading DEFAULT VYPNUTÝM"
+        )
+    return (
+        f".NET {v} — moderní async/await, IHttpClientFactory, "
+        f"EF Core s lazy loading DEFAULT VYPNUTÝM"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Pomocné funkce — Bitbucket, Jira, Claude
 # ---------------------------------------------------------------------------
 
@@ -166,9 +296,7 @@ def extract_jira_id(text: str) -> str | None:
 
 
 async def get_bitbucket_diff(diff_url: str, token: str) -> str:
-    """Stáhne unified diff PR přímo z URL z Bitbucket payloadu.
-    Používá Bearer token a follow_redirects=True pro případ přesměrování.
-    """
+    """Stáhne unified diff PR přímo z URL z Bitbucket payloadu."""
     async with httpx.AsyncClient(follow_redirects=True) as client:
         resp = await client.get(
             diff_url,
@@ -225,8 +353,16 @@ def _extract_text(field) -> str:
     return " ".join(texts).strip()
 
 
-def build_prompt(diff: str, jira: dict, pr_title: str, line_count: int, ignored_files: list[str]) -> str:
-    """Sestaví prompt pro Claude — včetně informace o filtrovaných souborech."""
+def build_prompt(
+    diff: str,
+    jira: dict,
+    pr_title: str,
+    line_count: int,
+    ignored_files: list[str],
+    angular_version: str | None = None,
+    dotnet_version: str | None = None,
+) -> str:
+    """Sestaví prompt pro Claude — včetně stack kontextu a filtrovaných souborů."""
     jira_section = ""
     if jira:
         jira_section = f"""
@@ -237,10 +373,29 @@ def build_prompt(diff: str, jira: dict, pr_title: str, line_count: int, ignored_
 **Acceptance criteria:** {jira['acceptance_criteria'] or '(není)'}
 """
 
-    # Informace o filtrovaných souborech
     filter_note = ""
     if ignored_files:
         filter_note = f"\n> ℹ️ Automaticky ignorované soubory (generované, bez review): {', '.join(ignored_files)}\n"
+
+    # Stack kontext — přidá se pouze pokud se podařilo detekovat verzi
+    angular_ctx = _angular_note(angular_version)
+    dotnet_ctx  = _dotnet_note(dotnet_version)
+
+    stack_section = ""
+    if angular_ctx:
+        stack_section += f"- Pro Angular: {angular_ctx}\n"
+    else:
+        stack_section += (
+            "- Pro Angular (verze nezjištěna): sleduj OnPush change detection, "
+            "memory leaky v subscriptions (chybějící unsubscribe/takeUntil), přímé DOM manipulace\n"
+        )
+    if dotnet_ctx:
+        stack_section += f"- Pro .NET: {dotnet_ctx}\n"
+    else:
+        stack_section += (
+            "- Pro .NET (verze nezjištěna): sleduj async/await správnost, "
+            "IDisposable, N+1 dotazy v ORM\n"
+        )
 
     diff_preview = diff[:16000] + ("\n...[diff zkrácen]" if len(diff) > 16000 else "")
 
@@ -267,11 +422,29 @@ Zásady pro tvoje hodnocení:
 - Piš stručně — autor PR zná kontext, nepotřebuje vysvětlení základních pojmů. Maximálně 2-3 věty na každý nález.
 - Každý nález začni prefixem: "BLOCKER:" nebo "DOPORUČENÍ:" nebo "OTÁZKA:"
 - Pokud nevidíš testové soubory v diffu, napiš pouze: "Testy v diffu nejsou — ověřit ručně."
-- Ignoruj triviální nálezy jako zakomentovaný kód, chybějící mezery, nebo drobné formátování
+- Ignoruj triviální nálezy jako zakomentovaný kód, chybějící mezery, nebo drobné formátování.
 - Pokud nález nepomůže předejít bugu, výpadku nebo technickému dluhu, nevypisuj ho.
-- Ignoruj importy a přejmenovávání souborů jako standalone nálezy
-- Pokud vidíš jen přesun kódu bez změny logiky, uveď to v overview
-- Pokud diff obsahuje více než 20 souborů, zaměř se primárně na core business logiku
+- Ignoruj importy a přejmenovávání souborů jako standalone nálezy.
+- Pokud vidíš jen přesun kódu bez změny logiky, uveď to v overview.
+- Pokud diff obsahuje více než 20 souborů, zaměř se primárně na core business logiku.
+
+Tento projekt je multi-stack: Angular (TypeScript), .NET (C#), HTML, SASS.
+Přizpůsob review danému jazyku a jeho konvencím podle těchto pravidel:
+
+{stack_section}
+- Pro HTML/SASS: sleduj Core Web Vitals:
+  - LCP: chybějící lazy loading na obrázcích, chybějící preload na kritických zdrojích, render-blocking CSS/JS
+  - CLS: chybějící width/height na obrázcích a embedech, layout shifty při načítání fontů (font-display)
+  - INP: těžké CSS animace na width/margin/top místo transform/opacity které jdou přes compositor
+  Přístupnost (WCAG 2.2) — reportuj pouze pokud vidíš konkrétní porušení v diffu:
+  - Chybějící alt text na obrázcích (nebo alt="" pro dekorativní obrázky)
+  - Interaktivní prvky bez label (input bez label/aria-label, button bez textu nebo aria-label)
+  - Špatná heading hierarchie (h1→h3 bez h2, více h1 na stránce)
+  - Chybějící focus styles (outline: none bez náhrady)
+  - Nízký kontrast barev — POUZE pokud vidíš hardcoded barvy v HTML/SASS, nespekuluj
+  - Klikatelné div/span elementy bez role="button" a tabindex="0"
+  - Formuláře bez správných label vazeb, chybějící aria-required
+  - Dynamický obsah bez aria-live pro screen readery
 
 ## Pull request
 **Název PR:** {pr_title}
@@ -304,7 +477,7 @@ Proveď code review a vrať odpověď jako JSON objekt s touto strukturou:
       "file": "cesta/k/souboru.ts",
       "line": 42,
       "severity": "critical|major|minor|nit",
-      "category": "bug|security|performance|test|readability|architecture",
+      "category": "bug|security|performance|test|readability|architecture|config|error_handling|logging|migration|dependency|concurrency",
       "comment": "Popis problému a navržená oprava"
     }}
   ]
@@ -324,6 +497,12 @@ Kategorie:
 - test: chybějící unit testy pro změněné funkce
 - readability: špatné pojmenování, složitost, DRY
 - architecture: těsná vazba, špatný návrh
+- config: hardcoded hodnoty, chybějící env variables, secrets v kódu
+- error_handling: spolykané výjimky, chybějící fallback, špatné HTTP status kódy
+- logging: chybějící logy pro kritické operace, logování citlivých dat
+- migration: breaking changes v DB schématu, chybějící rollback strategie
+- dependency: nová závislost bez zdůvodnění, zranitelná verze balíčku
+- concurrency: race condition, chybějící zamykání, problém při paralelním zpracování
 
 Vrať POUZE validní JSON bez jakéhokoliv dalšího textu nebo markdown backticks.
 """
@@ -363,7 +542,6 @@ async def post_bitbucket_comment(
     )
     body: dict = {"content": {"raw": comment}}
 
-    # Inline komentář – přidá se přímo k danému řádku v souboru
     if file_path and line:
         body["inline"] = {"to": line, "path": file_path}
 
@@ -393,12 +571,20 @@ def format_severity(severity: str) -> str:
 
 def format_category(category: str) -> str:
     icons = {
-        "bug":          "🐛 Bug",
-        "security":     "🔒 Bezpečnost",
-        "performance":  "⚡ Výkon",
-        "test":         "🧪 Test",
-        "readability":  "📖 Čitelnost",
-        "architecture": "🏗️ Architektura",
+        # Původní kategorie
+        "bug":            "🐛 Bug",
+        "security":       "🔒 Bezpečnost",
+        "performance":    "⚡ Výkon",
+        "test":           "🧪 Test",
+        "readability":    "📖 Čitelnost",
+        "architecture":   "🏗️ Architektura",
+        # Nové kategorie
+        "config":         "⚙️ Konfigurace",
+        "error_handling": "🚨 Error handling",
+        "logging":        "📋 Logování",
+        "migration":      "🗄️ Migrace",
+        "dependency":     "📦 Závislost",
+        "concurrency":    "🔀 Konkurence",
     }
     return icons.get(category, category)
 
@@ -448,8 +634,14 @@ async def bitbucket_webhook(request: Request):
 
     print(f"[CR] PR #{pr_id} | branch: {branch} | Jira: {jira_id}")
 
-    # Stáhni diff
-    raw_diff = await get_bitbucket_diff(diff_url, token)
+    # Stáhni diff + detekuj stack verze paralelně
+    raw_diff, angular_version, dotnet_version = await asyncio.gather(
+        get_bitbucket_diff(diff_url, token),
+        get_angular_version(workspace, repo_slug, token),
+        get_dotnet_version(workspace, repo_slug, token),
+    )
+
+    print(f"[CR] Stack: Angular={angular_version or '?'} | .NET={dotnet_version or '?'}")
 
     # -----------------------------------------------------------------------
     # FILTR 1 — Odstraň ignorované soubory (package-lock.json atd.)
@@ -495,8 +687,12 @@ async def bitbucket_webhook(request: Request):
     # -----------------------------------------------------------------------
     jira = await get_jira_ticket(jira_id) if jira_id else {}
 
-    prompt = build_prompt(filtered_diff, jira, pr_title, line_count, ignored_files)
-    raw    = await call_claude(prompt)
+    prompt = build_prompt(
+        filtered_diff, jira, pr_title, line_count, ignored_files,
+        angular_version=angular_version,
+        dotnet_version=dotnet_version,
+    )
+    raw = await call_claude(prompt)
 
     # Parsuj JSON odpověď od Claudea
     try:
@@ -504,7 +700,6 @@ async def bitbucket_webhook(request: Request):
         review = json.loads(clean)
     except json.JSONDecodeError as e:
         print(f"[JSON ERROR] {e}\nRaw: {raw[:500]}")
-        # Fallback – vlož raw odpověď jako obecný komentář
         await post_bitbucket_comment(workspace, repo_slug, pr_id,
             f"🤖 **Automatické code review** (Claude AI){' | Jira: ' + jira_id if jira_id else ''}\n\n{raw}",
             token)
@@ -525,6 +720,10 @@ async def bitbucket_webhook(request: Request):
         f"|---------|--------|\n"
         f"| Změněných řádků | {line_count} |\n"
     )
+    if angular_version:
+        header += f"| Angular verze | {angular_version} |\n"
+    if dotnet_version:
+        header += f"| .NET verze | {dotnet_version} |\n"
     if ignored_files:
         header += f"| Ignorované soubory | {', '.join(ignored_files)} |\n"
     header += (
@@ -535,7 +734,6 @@ async def bitbucket_webhook(request: Request):
         f"---\n"
     )
 
-    # Přidej sekci pouze pokud Claude našel něco konkrétního (ne null)
     sections = [
         ("🐛 Bugy a logické chyby",  summary.get("bugs")),
         ("🔒 Bezpečnost",             summary.get("security")),
