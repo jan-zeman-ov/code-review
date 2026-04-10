@@ -18,6 +18,25 @@ from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
+# Cache zpracovaných PR – zabraňuje duplicitnímu review při Bitbucket retry
+import time
+_processed_prs: dict[str, float] = {}
+DEDUP_TTL = 900  # 5 minut
+
+def _is_already_processed(key: str) -> bool:
+    if key in _processed_prs:
+        if time.time() - _processed_prs[key] < DEDUP_TTL:
+            return True
+        del _processed_prs[key]
+    return False
+
+def _mark_as_processed(key: str) -> None:
+    _processed_prs[key] = time.time()
+    cutoff = time.time() - DEDUP_TTL
+    for k in list(_processed_prs.keys()):
+        if _processed_prs[k] < cutoff:
+            del _processed_prs[k]
+
 # ---------------------------------------------------------------------------
 # Konfigurace – nastav jako Environment Variables (nikdy nekládej klíče do kódu!)
 # ---------------------------------------------------------------------------
@@ -414,6 +433,13 @@ async def bitbucket_webhook(request: Request):
         raise HTTPException(400, f"Chybí BB token pro repozitář '{repo_slug}' – přidej '{env_name}' do Railway Variables")
 
     jira_id = extract_jira_id(branch) or extract_jira_id(pr_title) or extract_jira_id(pr_desc)
+
+    # Deduplikace — ignoruj Bitbucket retry webhooky
+    dedup_key = f"{workspace}/{repo_slug}/{pr_id}"
+    if _is_already_processed(dedup_key):
+        print(f"[CR] PR #{pr_id} duplicate — ignoruji")
+        return JSONResponse({"status": "duplicate", "pr_id": pr_id})
+    _mark_as_processed(dedup_key)
 
     print(f"[CR] PR #{pr_id} | branch: {branch} | Jira: {jira_id}")
 
