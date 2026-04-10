@@ -361,6 +361,124 @@ def _dotnet_note(version: str | None) -> str:
     )
 
 
+def _build_angular_performance_note(version: str | None) -> str:
+    """Vrátí verzově specifické performance tipy pro Angular."""
+    if not version:
+        return (
+            "angular change detection (chybějící OnPush), "
+            "memory leak (subscribe bez unsubscribe/takeUntil), "
+            "trackBy chybí v *ngFor pro velké listy"
+        )
+    v = int(version)
+    if v <= 8:
+        return (
+            "angular change detection (chybějící OnPush — v Angular 6-8 kritické), "
+            "memory leak (subscribe bez unsubscribe v ngOnDestroy), "
+            "trackBy chybí v *ngFor pro velké listy, "
+            "pure pipe místo metody v template (metoda se volá při každém CD cyklu)"
+        )
+    elif v <= 12:
+        return (
+            "angular change detection (chybějící OnPush), "
+            "memory leak (subscribe bez unsubscribe/takeUntil), "
+            "trackBy chybí v *ngFor, "
+            "async pipe preferován před manuálním subscribe"
+        )
+    elif v <= 16:
+        return (
+            "angular change detection (chybějící OnPush), "
+            "memory leak (subscribe bez takeUntil nebo async pipe), "
+            "trackBy chybí v *ngFor, "
+            "inject() místo constructor injection pro lepší tree-shaking"
+        )
+    elif v == 17:
+        return (
+            "angular change detection (OnPush nebo Signals pro reaktivní stav), "
+            "memory leak (subscribe bez takeUntil — nebo toSignal() pro automatický cleanup), "
+            "track expression chybí v @for pro velké listy"
+        )
+    else:  # v18+
+        return (
+            "Signals preferované před RxJS pro lokální stav (méně paměti, žádný leak), "
+            "memory leak (subscribe bez takeUntil pokud RxJS stále použit), "
+            "effect() bez cleanup funkce může leakovat, "
+            "@for track expression povinný — zkontroluj správnost trackování"
+        )
+
+
+def _build_dotnet_performance_note(version: str | None) -> str:
+    """Vrátí verzově specifické performance tipy pro .NET."""
+    if not version:
+        return (
+            "connection pool exhaustion (chybějící using() u DB spojení), "
+            "string concatenation v cyklu (+ místo StringBuilder)"
+        )
+    if "v4." in version or "net4" in version:
+        return (
+            "EF6 lazy loading (navigační properties v cyklu bez Include() — lazy loading DEFAULT ZAPNUTÝ), "
+            "missing pagination (ToList() bez Skip/Take nad velkou tabulkou), "
+            "large payload (celá EF entita místo DTO), "
+            "connection pool exhaustion (chybějící using() u SqlConnection nebo DbContext), "
+            "string concatenation v cyklu (+ místo StringBuilder), "
+            "sync over async (Task.Result nebo .Wait() blokuje thread pool), "
+            "boxing/unboxing (value types v ArrayList nebo non-generic kolekci), "
+            "missing output caching (stejná data bez [OutputCache])"
+        )
+    major = re.search(r"net(\d+)", version)
+    v = int(major.group(1)) if major else 0
+    if v >= 8:
+        return (
+            "EF Core lazy loading (chybějící Include() nebo AsNoTracking() pro read-only dotazy), "
+            "missing pagination (ToListAsync() bez Skip/Take), "
+            "large payload (celá entita místo DTO projekce přímo v LINQ), "
+            "IHttpClientFactory nevyužit (přímý new HttpClient() — socket exhaustion), "
+            "missing CancellationToken (async metody bez propagace tokenu), "
+            "string concatenation v cyklu (+ místo StringBuilder nebo interpolace), "
+            "sync over async (Task.Result nebo .Wait())"
+        )
+    return (
+        "EF Core lazy loading (chybějící Include() nebo AsNoTracking()), "
+        "missing pagination (ToListAsync() bez Skip/Take), "
+        "connection pool exhaustion (chybějící using()), "
+        "sync over async (Task.Result nebo .Wait())"
+    )
+
+
+def _build_dotnet_security_note(version: str | None) -> str:
+    """Vrátí verzově specifické security tipy pro .NET."""
+    if not version:
+        return (
+            "CSRF (chybějící AntiForgeryToken), "
+            "mass assignment (chybějící Bind whitelist), "
+            "verbose errors (stack trace viditelný uživateli)"
+        )
+    if "v4." in version or "net4" in version:
+        return (
+            "CSRF (chybějící [ValidateAntiForgeryToken] na POST akcích v MVC), "
+            "IDOR (přístup k cizím datům bez ověření vlastnictví záznamu), "
+            "mass assignment (chybějící [Bind(Include=...)] whitelist v MVC modelech), "
+            "verbose errors (stack trace nebo DB chyba viditelná uživateli v produkci), "
+            "weak cryptography (MD5/SHA1 pro hesla — použij PBKDF2 nebo bcrypt), "
+            "SQL injection přes string concatenation (i s EF6 přes ExecuteSqlCommand)"
+        )
+    major = re.search(r"net(\d+)", version)
+    v = int(major.group(1)) if major else 0
+    if v >= 8:
+        return (
+            "IDOR (přístup k cizím datům bez ověření vlastnictví), "
+            "mass assignment (chybějící [Bind] nebo samostatné DTO), "
+            "verbose errors (UseExceptionHandler chybí nebo developer page v produkci), "
+            "weak cryptography (MD5/SHA1 místo bcrypt/PBKDF2), "
+            "SQL injection přes raw SQL v EF Core (FromSqlRaw bez parametrizace)"
+        )
+    return (
+        "CSRF (chybějící antiforgery middleware), "
+        "IDOR (přístup k cizím datům bez ověření vlastnictví), "
+        "mass assignment (chybějící DTO), "
+        "verbose errors (stack trace viditelný uživateli)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pomocné funkce — Bitbucket, Jira, Claude
 # ---------------------------------------------------------------------------
@@ -454,8 +572,11 @@ def build_prompt(
         filter_note = f"\n> ℹ️ Automaticky ignorované soubory (generované, bez review): {', '.join(ignored_files)}\n"
 
     # Stack kontext — přidá se pouze pokud se podařilo detekovat verzi
-    angular_ctx = _angular_note(angular_version)
-    dotnet_ctx  = _dotnet_note(dotnet_version)
+    angular_ctx  = _angular_note(angular_version)
+    dotnet_ctx   = _dotnet_note(dotnet_version)
+    angular_perf = _build_angular_performance_note(angular_version)
+    dotnet_perf  = _build_dotnet_performance_note(dotnet_version)
+    dotnet_sec   = _build_dotnet_security_note(dotnet_version)
 
     stack_section = ""
     if angular_ctx:
@@ -568,8 +689,8 @@ Pravidla pro inline komentáře:
 
 Kategorie:
 - bug: chyba v logice, neošetřená výjimka, špatná podmínka
-- security: XSS, SQL injection, citlivá data, autorizace
-- performance: N+1, zbytečné dotazy, velké cykly
+- security: XSS, SQL injection, citlivá data, autorizace, {dotnet_sec}
+- performance: N+1, zbytečné dotazy, velké cykly, {dotnet_perf}, {angular_perf}
 - test: chybějící unit testy pro změněné funkce
 - readability: špatné pojmenování, složitost, DRY
 - architecture: těsná vazba, špatný návrh
