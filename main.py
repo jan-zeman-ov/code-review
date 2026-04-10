@@ -269,6 +269,9 @@ Zásady pro tvoje hodnocení:
 - Pokud nevidíš testové soubory v diffu, napiš pouze: "Testy v diffu nejsou — ověřit ručně."
 - Ignoruj triviální nálezy jako zakomentovaný kód, chybějící mezery, nebo drobné formátování
 - Pokud nález nepomůže předejít bugu, výpadku nebo technickému dluhu, nevypisuj ho.
+- Ignoruj importy a přejmenovávání souborů jako standalone nálezy
+- Pokud vidíš jen přesun kódu bez změny logiky, uveď to v overview
+- Pokud diff obsahuje více než 20 souborů, zaměř se primárně na core business logiku
 
 ## Pull request
 **Název PR:** {pr_title}
