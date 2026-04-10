@@ -248,12 +248,12 @@ async def get_angular_version(workspace: str, repo_slug: str, token: str) -> str
                     seen_versions.add(match.group(1))
 
             if not seen_versions:
-                # Angular projekt ale verze nenalezena → fallback na v12 (NgModules)
-                return "12"
+                # Angular projekt ale verze nenalezena → fallback na v6 (NgModules)
+                return "6"
             # Vrať nejvyšší nalezenou verzi
             return str(max(int(v) for v in seen_versions))
         except Exception:
-            return "12"  # bezpečný fallback
+            return "6"  # bezpečný fallback
 
 
 async def get_dotnet_version(workspace: str, repo_slug: str, token: str) -> str | None:
@@ -275,6 +275,7 @@ async def get_dotnet_version(workspace: str, repo_slug: str, token: str) -> str 
                         if sf["path"].endswith(".csproj"):
                             candidates.append(sf["path"])
 
+            versions = []
             for csproj_path in candidates:
                 url = (
                     f"https://api.bitbucket.org/2.0/repositories/"
@@ -290,8 +291,13 @@ async def get_dotnet_version(workspace: str, repo_slug: str, token: str) -> str 
                     resp.text,
                 )
                 if match:
-                    return match.group(1).strip()
-            return None
+                    versions.append(match.group(1).strip())
+
+            if not versions:
+                return None
+            # Majority vote — vrať nejčastější verzi (v4.8 x5 vyhraje nad v4.5 x1)
+            from collections import Counter
+            return Counter(versions).most_common(1)[0][0]
         except Exception:
             return None
 
