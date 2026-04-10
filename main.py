@@ -339,9 +339,9 @@ async def post_bitbucket_comment(
             json=body,
             timeout=15,
         )
-        # Inline komentář může selhat pokud řádek neexistuje v diff – logujeme ale nepřerušujeme
+        print(f"[BB COMMENT] status={resp.status_code} url={url} file={file_path} line={line} response={resp.text[:300]}")
         if not resp.is_success:
-            print(f"[BB COMMENT ERROR] status={resp.status_code} file={file_path} line={line} body={resp.text}")
+            print(f"[BB COMMENT ERROR] status={resp.status_code} body={resp.text}")
         else:
             resp.raise_for_status()
 
