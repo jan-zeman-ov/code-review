@@ -207,15 +207,21 @@ async def _fetch_json_file(client: httpx.AsyncClient, workspace: str, repo_slug:
 
 async def _list_dir(client: httpx.AsyncClient, workspace: str, repo_slug: str,
                      token: str, path: str = "") -> list[dict]:
-    """Vrátí seznam souborů v dané cestě repozitáře."""
+    """Vrátí VŠECHNY soubory v dané cestě repozitáře — se stránkováním."""
+    all_values = []
     url = (
         f"https://api.bitbucket.org/2.0/repositories/"
         f"{workspace}/{repo_slug}/src/HEAD/{path}"
+        f"?pagelen=100"
     )
-    resp = await client.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
-    if not resp.is_success:
-        return []
-    return resp.json().get("values", [])
+    while url:
+        resp = await client.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+        if not resp.is_success:
+            break
+        data = resp.json()
+        all_values.extend(data.get("values", []))
+        url = data.get("next")  # None pokud není další stránka
+    return all_values
 
 
 async def get_angular_version(workspace: str, repo_slug: str, token: str) -> str | None:
