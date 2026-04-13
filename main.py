@@ -708,6 +708,7 @@ Kategorie:
 - concurrency: race condition, chybějící zamykání, problém při paralelním zpracování
 
 Vrať POUZE validní JSON bez jakéhokoliv dalšího textu nebo markdown backticks.
+Všechny texty v JSON (overview, key_points, bugs, security, performance, tests, architecture, readability, regression_risk, goal_alignment, comment) piš v češtině. Technické termíny, názvy metod, proměnných, knihoven a programátorský slang ponechej v originále (např. "N+1 query", "race condition", "memory leak", názvy funkcí atd.).
 """
 
 
