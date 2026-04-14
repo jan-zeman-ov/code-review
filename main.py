@@ -630,6 +630,9 @@ Zásady pro tvoje hodnocení:
 - Ignoruj importy a přejmenovávání souborů jako standalone nálezy.
 - Pokud vidíš jen přesun kódu bez změny logiky, uveď to v overview.
 - Pokud diff obsahuje více než 20 souborů, zaměř se primárně na core business logiku.
+- Tento projekt je legacy kód — nenavrhuj architektonické refaktoringy (DI, interface pattern, celkový redesign) pokud nejsou přímo součástí PR. Pokud vidíš konzistentní pattern v celém projektu (např. using místo DI), považuj ho za záměr, ne za chybu.
+- Pokud kód obsahuje komentář vysvětlující PROČ je něco uděláno daným způsobem, respektuj ho jako záměr autora a nehlašuj to jako problém.
+- Pokud je PR malý (do 50 řádků) a nevidíš žádný reálný problém, vrať APPROVE. Není nutné vždy něco najít — preferuj 2-3 konkrétní nálezy nad mnoha vágními.
 
 Tento projekt je multi-stack: Angular (TypeScript), .NET (C#), HTML, SASS.
 Přizpůsob review danému jazyku a jeho konvencím podle těchto pravidel:
